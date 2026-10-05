@@ -1,0 +1,125 @@
+# Example: run multi-node SFT on Kubernetes via a KubeRay RayJob.
+#
+# Prereqs:
+#   1. KubeRay operator installed:  helm install kuberay-operator kuberay/kuberay-operator
+#   2. Training image built + pushed:  REPO=ghcr.io/you/mbsft docker buildx bake
+#   3. A volume for models/dataset/outputs shared across workers (RWX PVC,
+#      or hostPath on a single node).
+#   4. Optional: a Secret `hf-wandb-secrets` with HF_TOKEN / WANDB_API_KEY keys:
+#        kubectl create secret generic hf-wandb-secrets \
+#          --from-literal=HF_TOKEN=hf_... --from-literal=WANDB_API_KEY=...
+#
+# Apply:  kubectl apply -f k8s/rayjob.yaml
+# Watch:  kubectl logs -f job/<job-name>-submit
+#
+# Note: this manifest manages its own Ray cluster; launch_ray.sh is NOT used here
+# (it targets AWS Batch / plain Kubernetes pods driven by K8S_* env vars).
+
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: qwen3-4b-sft
+spec:
+  # Stream entrypoint logs and keep the RayCluster around on failure for debugging.
+  submissionMode: K8sJobMode
+  shutdownAfterJobFinishes: true
+  # autoscaler:
+  #   enabled: true
+  entrypoint: >-
+    python scripts/sft_ray.py
+    --model /data/models/Qwen3-4B-Thinking-2507
+    --data-path /data/dataset
+    --output-dir /data/outputs/qwen3-4b-sft
+    --chat-template chat_templates/qwen3_2507_thinking.jinja
+    --tensor-model-parallel-size 4
+    --context-parallel-size 2
+    --sequence-parallel
+    --seq-length 131072
+    --global-batch-size 32
+    --micro-batch-size 1
+    --lr 5e-5
+    --lr-warmup-iters 0
+    --epochs 3
+    --save-interval 1
+    --wandb-project my-sft-run
+
+  # The repo is baked into the image at /workdir; use it as the Ray job's
+  # working dir so `scripts/` and `chat_templates/` resolve for driver + actors.
+  runtimeEnvYAML: |
+    working_dir: "file:///workdir"
+
+  rayClusterSpec:
+    headGroupSpec:
+      # Head only runs GCS + dashboard; exclude it from GPU scheduling.
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-cpus: "0"
+        num-gpus: "0"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: ghcr.io/CHANGE-ME/mbsft:megatron_bridge
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - secretRef:
+                    name: hf-wandb-secrets
+                    optional: true
+              resources:
+                requests: {cpu: "4", memory: 16Gi, ephemeral-storage: 20Gi}
+                limits:   {cpu: "4", memory: 16Gi, ephemeral-storage: 20Gi}
+              volumeMounts:
+                - {name: data, mountPath: /data}
+                - {name: dshm, mountPath: /dev/shm}
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: my-data-pvc   # <-- your RWX PVC (or use hostPath)
+            # Shared memory for NCCL/Ray object spilling; size generously.
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 32Gi
+
+    workerGroupSpecs:
+      # replicas x gpus-per-node = world_size. Here: 2 nodes x 8 GPUs = 16.
+      # With tp=4 and cp=2 (below), that gives dp=2 and each DP rank covers the
+      # model across 8 GPUs — tune --num-nodes/--gpus-per-node or replicas to
+      # match your cluster.
+      - groupName: gpu-workers
+        replicas: 2
+        minReplicas: 0
+        rayStartParams: {}
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: ghcr.io/CHANGE-ME/mbsft:megatron_bridge
+                imagePullPolicy: IfNotPresent
+                envFrom:
+                  - secretRef:
+                      name: hf-wandb-secrets
+                      optional: true
+                resources:
+                  requests:
+                    cpu: "112"
+                    memory: 512Gi
+                    ephemeral-storage: 100Gi
+                    nvidia.com/gpu: "8"
+                  limits:
+                    cpu: "112"
+                    memory: 512Gi
+                    ephemeral-storage: 100Gi
+                    nvidia.com/gpu: "8"
+                volumeMounts:
+                  - {name: data, mountPath: /data}
+                  - {name: dshm, mountPath: /dev/shm}
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: my-data-pvc   # <-- your RWX PVC (or use hostPath)
+              # Shared memory for NCCL/Ray object spilling; size generously.
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 128Gi
